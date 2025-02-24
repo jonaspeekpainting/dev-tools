@@ -1,6 +1,8 @@
 import boto3
 import json
 import time
+import requests
+import subprocess
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 
@@ -14,6 +16,8 @@ class MicroserviceConfig:
     provisioned_concurrency: int = 5
     dynamo_read_capacity: int = 5
     dynamo_write_capacity: int = 5
+    github_token: str  # GitHub token to create repositories and manage actions
+    github_username: str  # GitHub username
 
 class AWSMicroserviceCreator:
     def __init__(self, config: MicroserviceConfig):
@@ -24,8 +28,11 @@ class AWSMicroserviceCreator:
         self.iam_client = boto3.client('iam', region_name=config.region)
 
     def create_microservice(self) -> Dict:
-        """Create all required AWS resources for the microservice"""
+        """Create all required AWS resources for the microservice and GitHub repo"""
         print(f"Creating microservice: {self.config.service_name}")
+        
+        # Create GitHub repository and sync code
+        repo_details = self.create_github_repo_and_push_code()
         
         # Create resources
         role_arn = self.create_lambda_role()
@@ -33,12 +40,120 @@ class AWSMicroserviceCreator:
         function_arn = self.create_lambda_function(role_arn, table_name)
         api_id = self.create_api_gateway(function_arn)
         
+        # Return AWS resources and GitHub details
         return {
             'role_arn': role_arn,
             'table_name': table_name,
             'function_arn': function_arn,
-            'api_id': api_id
+            'api_id': api_id,
+            'github_repo_url': repo_details['clone_url']
         }
+
+    def create_github_repo_and_push_code(self) -> Dict:
+        """Create a GitHub repository and push code to it"""
+        repo_name = f"{self.config.service_name}-repo"
+        
+        # Create GitHub repo using GitHub API
+        repo_url = self.create_github_repo(repo_name)
+        
+        # Push microservice code to the GitHub repo
+        self.push_code_to_github(repo_url)
+        
+        # Create GitHub Actions workflow for auto-deployment
+        self.create_github_actions_workflow(repo_name)
+        
+        return {'clone_url': repo_url}
+
+    def create_github_repo(self, repo_name: str) -> str:
+        """Create a GitHub repository using the GitHub API"""
+        url = 'https://api.github.com/user/repos'
+        headers = {
+            'Authorization': f'token {self.config.github_token}'
+        }
+        
+        data = {
+            "name": repo_name,
+            "private": False,
+            "auto_init": True,
+            "gitignore_template": "Python"
+        }
+        
+        response = requests.post(url, headers=headers, json=data)
+        
+        if response.status_code == 201:
+            print(f"Successfully created GitHub repository: {repo_name}")
+            return response.json()['clone_url']
+        else:
+            print(f"Failed to create GitHub repo: {response.status_code}, {response.text}")
+            return ""
+
+    def push_code_to_github(self, repo_url: str):
+        """Push the microservice code to GitHub"""
+        # Assuming that the code is in the current working directory
+        local_directory = '.'  # You can specify the path to the microservice code
+        
+        subprocess.run(["git", "init"], cwd=local_directory)
+        subprocess.run(["git", "remote", "add", "origin", repo_url], cwd=local_directory)
+        subprocess.run(["git", "add", "."], cwd=local_directory)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=local_directory)
+        subprocess.run(["git", "push", "-u", "origin", "main"], cwd=local_directory)
+        
+        print(f"Successfully pushed code to {repo_url}")
+
+    def create_github_actions_workflow(self, repo_name: str):
+        """Create a GitHub Actions workflow for Lambda auto-deployment"""
+        url = f'https://api.github.com/repos/{self.config.github_username}/{repo_name}/contents/.github/workflows/deploy.yml'
+        headers = {
+            'Authorization': f'token {self.config.github_token}'
+        }
+        
+        workflow_content = """
+name: Deploy to AWS Lambda
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v2
+
+    - name: Set up AWS CLI
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: Create a deployment package
+      run: |
+        zip -r function.zip .  # Create a ZIP of your code
+
+    - name: Deploy to AWS Lambda
+      run: |
+        aws lambda update-function-code --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} --zip-file fileb://function.zip
+
+    - name: Clean up
+      run: |
+        rm -rf function.zip
+"""
+        
+        data = {
+            "message": "Add GitHub Actions workflow for AWS Lambda deployment",
+            "content": workflow_content.encode("utf-8").decode("utf-8")
+        }
+        
+        response = requests.put(url, headers=headers, json=data)
+        
+        if response.status_code == 201:
+            print("Successfully created GitHub Actions workflow.")
+        else:
+            print(f"Failed to create workflow: {response.status_code}, {response.text}")
 
     def create_lambda_role(self) -> str:
         """Create IAM role for Lambda with necessary permissions"""
@@ -53,7 +168,6 @@ class AWSMicroserviceCreator:
             }]
         }
         
-        # Create basic role
         try:
             response = self.iam_client.create_role(
                 RoleName=role_name,
@@ -263,7 +377,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 if __name__ == '__main__':
     config = MicroserviceConfig(
         service_name='sample-service',
-        region='us-east-1'
+        region='us-east-1',
+        github_token='YOUR_GITHUB_TOKEN',
+        github_username='YOUR_GITHUB_USERNAME'
     )
     
     creator = AWSMicroserviceCreator(config)
